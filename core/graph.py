@@ -11,14 +11,20 @@ class KnowledgeGraph:
         self.graph.add_edge(from_node, to_node, relation=relation, weight=weight)
 
     def find(self, concept):
-        if concept in self.graph:
-            neighbors = list(self.graph.neighbors(concept))
-            edges = self.graph.edges(concept, data=True)
-            return {
-                "concept": concept,
-                "relations": [(u, d['relation'], v) for u, v, d in edges]
-            }
-        return None
+        if concept not in self.graph:
+            return None
+
+        results = []
+
+        # Исходящие связи (что концепт делает/имеет)
+        for u, v, data in self.graph.edges(concept, data=True):
+            results.append((u, data['relation'], v))
+
+        # Входящие связи (кто связан с концептом)
+        for u, v, data in self.graph.in_edges(concept, data=True):
+            results.append((u, data['relation'], v))
+
+        return {"concept": concept, "relations": results} if results else None
 
     def related(self, concept, depth=2):
         if concept not in self.graph:
