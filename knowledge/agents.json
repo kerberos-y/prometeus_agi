@@ -115,5 +115,23 @@
     "response": "Я знаю паттерн: такое_нейрон",
     "strength": 0.5,
     "activations": 0
+  },
+  "ноги": {
+    "id": "agent_ноги",
+    "pattern": [
+      "ноги"
+    ],
+    "response": "Я знаю паттерн: ноги",
+    "strength": 0.5,
+    "activations": 0
+  },
+  "такое_ноги": {
+    "id": "agent_такое_ноги",
+    "pattern": [
+      "такое_ноги"
+    ],
+    "response": "Я знаю паттерн: такое_ноги",
+    "strength": 0.5,
+    "activations": 0
   }
 }

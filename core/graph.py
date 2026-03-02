@@ -13,18 +13,15 @@ class KnowledgeGraph:
     def find(self, concept):
         if concept not in self.graph:
             return None
-
         results = []
-
-        # Исходящие связи (что концепт делает/имеет)
         for u, v, data in self.graph.edges(concept, data=True):
             results.append((u, data['relation'], v))
-
-        # Входящие связи (кто связан с концептом)
         for u, v, data in self.graph.in_edges(concept, data=True):
             results.append((u, data['relation'], v))
-
-        return {"concept": concept, "relations": results} if results else None
+        
+        # Возвращаем свойства узла
+        properties = dict(self.graph.nodes[concept])
+        return {"concept": concept, "relations": results, "properties": properties}
 
     def related(self, concept, depth=2):
         if concept not in self.graph:

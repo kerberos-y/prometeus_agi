@@ -16,23 +16,29 @@ def load_knowledge(graph, path="knowledge/base.json"):
         data = json.load(f)
     for concept in data["concepts"]:
         name = concept.pop("name")
+        # concept теперь содержит description и другие свойства
         graph.add_concept(name, concept)
     for rel in data["relations"]:
         graph.add_relation(rel["from"], rel["to"], rel["type"], rel["weight"])
-    console.print(f"[green]Загружено концептов: {len(data['concepts'])}[/green]")
-    console.print(f"[green]Загружено связей: {len(data['relations'])}[/green]")
 
 def learn(word, explanation, graph):
     with open("knowledge/base.json", "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    existing_names = []
-    for c in data["concepts"]:
-        if "name" in c:
-            existing_names.append(c["name"])
+    existing_names = [c["name"] for c in data["concepts"] if "name" in c]
 
     if word not in existing_names:
-        data["concepts"].append({"name": word})
+        # СОХРАНЯЕМ description прямо в концепт!
+        data["concepts"].append({
+            "name": word,
+            "description": explanation
+        })
+    else:
+        # Обновляем description если уже есть
+        for c in data["concepts"]:
+            if c.get("name") == word:
+                c["description"] = explanation
+                break
 
     explanation_tokens = explanation.lower().split()
     for token in explanation_tokens:
@@ -66,14 +72,25 @@ def process_query(query, graph, language, memory, pattern, spawn, response, sear
         if found:
             results.append(found)
 
-    # Шаг 3 — запоминаем
+    # Шаг 3 — если контекстный запрос ("расскажи", "подробнее") — берём из памяти
+    if not results and parsed.get("is_context_request"):
+        context = memory.get_context(last_n=3)
+        for ctx in context:
+            for token in ctx.get("tokens", []):
+                found = graph.find(token)
+                if found and found not in results:
+                    results.append(found)
+        if results:
+            console.print(f"[dim]Контекстный запрос — использую память[/dim]")
+
+    # Шаг 4 — запоминаем
     memory.remember({"query": query, "tokens": parsed["tokens"]})
 
-    # Шаг 4 — наблюдаем паттерны
+    # Шаг 5 — наблюдаем паттерны
     pattern.observe(parsed["tokens"])
     frequent = pattern.should_spawn()
 
-    # Шаг 5 — создаём новых агентов
+    # Шаг 6 — создаём новых агентов
     new_spawned = []
     if frequent:
         for p in frequent:
@@ -85,12 +102,12 @@ def process_query(query, graph, language, memory, pattern, spawn, response, sear
         console.print(f"[green]✓ Новые агенты: {new_spawned}[/green]")
         console.print(f"[cyan]Всего агентов: {len(spawn.get_all())}[/cyan]")
 
-    # Шаг 6 — строим текстовый ответ
+    # Шаг 7 — строим текстовый ответ
     answer = response.build_response(results, parsed["intent"])
     console.print(Panel(answer, title="[bold cyan]PROMETEUS[/bold cyan]", border_style="cyan"))
 
-    # Шаг 7 — если не знает
-    if "Я не знаю" in answer:
+    # Шаг 8 — если не знает И это не контекстный запрос — ищем в интернете
+    if "Я не знаю" in answer and not parsed.get("is_context_request"):
         unknown = [
             t for t in parsed["meaningful"]
             if not graph.find(t) and len(t) > 2
@@ -109,14 +126,14 @@ def process_query(query, graph, language, memory, pattern, spawn, response, sear
                     ))
 
                     # Добавляем в граф
-                    graph.add_concept(word)
+                    graph.add_concept(word, {"description": explanation})
                     for token in explanation.lower().split():
                         clean = token.strip('.,;:()-—»«"\'')
                         if graph.find(clean):
                             graph.add_relation(word, clean, "СВЯЗАН_С", weight=0.8)
                     learn(word, explanation, graph)
 
-                    # Рекурсивно изучаем незнакомые слова из объяснения
+                    # Рекурсивно изучаем незнакомые слова
                     console.print(f"[cyan]Изучаю связанные понятия...[/cyan]")
                     search.enrich(word, explanation, graph, learn, console, depth=2)
 
@@ -125,7 +142,7 @@ def process_query(query, graph, language, memory, pattern, spawn, response, sear
                     console.print(f"[yellow]В интернете не нашёл. Что такое '{word}'? (пропустить — Enter)[/yellow]")
                     explanation = input("  Объясни: ").strip()
                     if explanation:
-                        graph.add_concept(word)
+                        graph.add_concept(word, {"description": explanation})
                         for token in explanation.lower().split():
                             if graph.find(token):
                                 graph.add_relation(word, token, "СВЯЗАН_С", weight=0.8)
@@ -134,13 +151,13 @@ def process_query(query, graph, language, memory, pattern, spawn, response, sear
                 console.print(f"[yellow]Нет интернета. Что такое '{word}'? (пропустить — Enter)[/yellow]")
                 explanation = input("  Объясни: ").strip()
                 if explanation:
-                    graph.add_concept(word)
+                    graph.add_concept(word, {"description": explanation})
                     for token in explanation.lower().split():
                         if graph.find(token):
                             graph.add_relation(word, token, "СВЯЗАН_С", weight=0.8)
                     learn(word, explanation, graph)
 
-    # Шаг 8 — показываем историю
+    # Шаг 9 — показываем историю
     context = memory.get_context(last_n=3)
     console.print(f"[dim]История: {[c['query'] for c in context]}[/dim]")
 
