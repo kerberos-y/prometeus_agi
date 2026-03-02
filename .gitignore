@@ -1,0 +1,38 @@
+# База данных SQLite
+knowledge/graph.db
+knowledge/*.db-wal
+knowledge/*.db-shm
+
+# Логи
+*.log
+prometeus.log
+
+# Кэш Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Виртуальное окружение
+venv/
+env/
+.venv/
+virtualenv/
+
+# Файлы IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Системные файлы
+.DS_Store
+Thumbs.db
+
+# Секреты (если появятся)
+.env
+*.env

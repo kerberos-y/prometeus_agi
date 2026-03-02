@@ -10,6 +10,7 @@ PROMETEUS AGI — Граф знаний
 - Транзакционная защита при записи
 - Обновление last_used для узлов
 - Совместимость со старым API
+- Методы для поиска структурных аналогий (get_edges_by_weight, find_structural_analogies)
 """
 
 from __future__ import annotations
@@ -348,6 +349,39 @@ class KnowledgeGraph:
         if not result:
             return []
         return result["relations"][:top_n]
+
+    # ── Методы для поиска структурных аналогий ───────────────────
+
+    def get_edges_by_weight(self, min_weight: float = 0.6) -> list[dict]:
+        """Возвращает все рёбра с весом выше порога."""
+        cursor = self.conn.execute(
+            "SELECT from_node, to_node, relation, weight FROM edges WHERE weight >= ?",
+            (min_weight,)
+        )
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def find_structural_analogies(self, min_weight: float = 0.6) -> list[dict]:
+        """
+        Ищет пары рёбер с одинаковым отношением, но разными узлами.
+        Возвращает список кандидатов для создания правил.
+        """
+        edges = self.get_edges_by_weight(min_weight)
+        candidates = []
+        # Группируем по отношению
+        groups = {}
+        for e in edges:
+            rel = e["relation"]
+            groups.setdefault(rel, []).append((e["from_node"], e["to_node"]))
+        for rel, pairs in groups.items():
+            if len(pairs) < 2:
+                continue
+            # Если в группе больше одной пары, считаем их кандидатами
+            candidates.append({
+                "relation": rel,
+                "pairs": pairs
+            })
+        return candidates
 
     # ── Статистика ────────────────────────────────────────────────
 
