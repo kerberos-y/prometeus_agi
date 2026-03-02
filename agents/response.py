@@ -1,16 +1,14 @@
 """
 agent_response — УРОВЕНЬ 1, БАЗОВЫЙ РЕФЛЕКС
 ============================================
-Собирает финальный ответ из результатов поиска по графу.
-Не обращается к БД напрямую — работает только с тем что передано в context.
+Собирает финальный ответ. Если есть диалоговый акт (greeting, thanks, goodbye) – 
+возвращает соответствующий ответ, игнорируя результаты графа.
 """
 
 from __future__ import annotations
-
 from core.agent import ReflexAgent
 
-
-_TEMPLATES: dict[str, str] = {
+_TEMPLATES = {
     "ЯВЛЯЕТСЯ_ЧАСТЬЮ": "{from} является частью {to}",
     "ЯВЛЯЕТСЯ":        "{from} является {to}",
     "ИМЕЕТ":           "{from} имеет {to}",
@@ -25,7 +23,7 @@ _TEMPLATES: dict[str, str] = {
     "PART_OF":         "{from} is part of {to}",
 }
 
-_NO_ANSWER: dict[str, str] = {
+_NO_ANSWER = {
     "ru": "Я не знаю об этом. Можете объяснить?",
     "uk": "Я не знаю про це. Можете пояснити?",
     "en": "I don't know about this. Can you explain?",
@@ -35,69 +33,77 @@ _NO_ANSWER: dict[str, str] = {
     "it": "Non lo so. Puoi spiegarlo?",
 }
 
+_DIALOGUE_RESPONSES = {
+    "greeting": {
+        "ru": "Привет! Чем могу помочь?",
+        "en": "Hello! How can I help?",
+        "de": "Hallo! Wie kann ich helfen?",
+        "fr": "Bonjour! Comment puis-je aider?",
+        "es": "¡Hola! ¿Cómo puedo ayudar?",
+        "it": "Ciao! Come posso aiutare?",
+    },
+    "thanks": {
+        "ru": "Пожалуйста!",
+        "en": "You're welcome!",
+        "de": "Gern geschehen!",
+        "fr": "Je vous en prie!",
+        "es": "¡De nada!",
+        "it": "Prego!",
+    },
+    "goodbye": {
+        "ru": "До свидания!",
+        "en": "Goodbye!",
+        "de": "Auf Wiedersehen!",
+        "fr": "Au revoir!",
+        "es": "¡Adiós!",
+        "it": "Arrivederci!",
+    },
+}
+
 
 class ResponseAgent(ReflexAgent):
-
     def __init__(self) -> None:
         super().__init__("agent_response")
 
     def process(self, context: dict) -> dict | None:
-        """
-        Читает context["graph_results"] и context["intent"].
-        Добавляет context["answer"] — готовый текст ответа.
-        """
-        results  = context.get("graph_results", [])
-        intent   = context.get("intent", "statement")
+        results = context.get("graph_results", [])
         language = context.get("language", "ru")
+        dialogue_act = context.get("dialogue_act")
 
-        answer = self.build_response(results, intent, language)
+        # Приоритет: диалоговые ответы
+        if dialogue_act and dialogue_act in _DIALOGUE_RESPONSES:
+            answer = _DIALOGUE_RESPONSES[dialogue_act].get(language, _DIALOGUE_RESPONSES[dialogue_act]["en"])
+            return {**context, "answer": answer}
+
+        # Обычный ответ из графа
+        answer = self._build_from_graph(results, language)
         return {**context, "answer": answer}
 
-    def build_response(
-        self,
-        results:  list[dict],
-        intent:   str,
-        language: str = "ru",
-    ) -> str:
+    def _build_from_graph(self, results: list[dict], language: str) -> str:
         if not results:
             return _NO_ANSWER.get(language, _NO_ANSWER["en"])
 
         lines = []
         for r in results:
-            # Пропускаем нестандартные результаты (от LearnedAgent-ов)
             if "concept" not in r:
                 if "hint" in r:
                     lines.append(r["hint"])
                 continue
 
-            concept    = r["concept"]
-            relations  = r.get("relations", [])
+            concept = r["concept"]
             properties = r.get("properties", {})
-
             if "description" in properties:
                 lines.append(f"{concept.capitalize()}: {properties['description']}")
 
-            if not relations and "description" not in properties:
-                lines.append(f"Знаю концепт '{concept}', но деталей мало.")
-                continue
-
-            shown = 0
-            for rel in relations[:5]:
-                # rel — это dict: {"from": ..., "relation": ..., "to": ..., "weight": ...}
-                if not isinstance(rel, dict):
-                    continue
+            for rel in r.get("relations", [])[:5]:
                 from_node = rel.get("from", "")
                 relation  = rel.get("relation", "СВЯЗАН_С")
                 to_node   = rel.get("to", "")
                 weight    = rel.get("weight", 1.0)
-
-                if weight < 0.2:  # не показываем слабые связи
+                if weight < 0.2 or from_node == to_node:
                     continue
-
                 template = _TEMPLATES.get(relation, "{from} — {to}")
                 line = template.format(**{"from": from_node, "to": to_node})
                 lines.append(line.capitalize() + ".")
-                shown += 1
 
-        no_answer = _NO_ANSWER.get(language, _NO_ANSWER["en"])
-        return "\n".join(lines) if lines else no_answer
+        return "\n".join(lines) if lines else _NO_ANSWER.get(language, _NO_ANSWER["en"])

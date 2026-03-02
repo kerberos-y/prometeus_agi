@@ -10,7 +10,7 @@ agent_memory — УРОВЕНЬ 1, БАЗОВЫЙ РЕФЛЕКС
     text        TEXT     — исходный текст
     language    TEXT     — ISO 639-1
     intent      TEXT     — question | command | statement
-    keywords    TEXT     — JSON список значимых токенов
+    keywords    TEXT     — JSON список значимых токенов (концептов)
     created_at  TEXT     — ISO timestamp
 """
 
@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import time
 from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -27,15 +26,13 @@ from typing import Optional
 from core.agent import ReflexAgent
 
 
-# ── Типы ──────────────────────────────────────────────────────────
-
 @dataclass
 class MemoryEntry:
     role:       str
     text:       str
     language:   str   = "ru"
     intent:     str   = "statement"
-    keywords:   list  = field(default_factory=list)
+    keywords:   list  = field(default_factory=list)  # список концептов
     created_at: str   = field(default_factory=lambda: datetime.utcnow().isoformat())
     id:         Optional[int] = None
 
@@ -44,7 +41,6 @@ class MemoryEntry:
 
 
 # ── Фразы контекстного запроса ────────────────────────────────────
-# "расскажи подробнее" и подобные — означают "продолжи о последней теме"
 
 _CONTEXT_PHRASES: dict[str, list[str]] = {
     "ru": ["расскажи подробнее","подробнее","расскажи больше","ещё",
@@ -63,8 +59,6 @@ def _is_context_request(text: str, language: str) -> bool:
     phrases = _CONTEXT_PHRASES.get(language, []) + _CONTEXT_PHRASES.get("en", [])
     return any(p in text_lower for p in phrases)
 
-
-# ── Агент ─────────────────────────────────────────────────────────
 
 class MemoryAgent(ReflexAgent):
     """
@@ -124,8 +118,6 @@ class MemoryAgent(ReflexAgent):
         except Exception as e:
             print(f"[agent_memory] Ошибка загрузки: {e}")
 
-    # ── process() — интерфейс агента ──────────────────────────────
-
     def process(self, context: dict) -> dict | None:
         """
         Принимает context из agent_language.
@@ -167,7 +159,7 @@ class MemoryAgent(ReflexAgent):
             "last_topic":         last_topic,
         }
 
-    # ── Публичный API для других агентов ──────────────────────────
+    # ── Публичный API ──────────────────────────────────────────
 
     def remember_agent_response(self, text: str, language: str = "ru") -> None:
         """Запомнить ответ агента (для истории диалога)."""
@@ -189,8 +181,6 @@ class MemoryAgent(ReflexAgent):
     def size(self) -> int:
         return len(self._cache)
 
-    # ── Внутренние методы ─────────────────────────────────────────
-
     def _remember(self, entry: MemoryEntry) -> None:
         self._cache.append(entry)
         self._unsaved += 1
@@ -198,8 +188,6 @@ class MemoryAgent(ReflexAgent):
             self._flush()
 
     def _flush(self) -> None:
-        """Пакетная запись несохранённых записей в SQLite."""
-        # Находим записи без id (новые)
         new_entries = [e for e in self._cache if e.id is None]
         if not new_entries:
             self._unsaved = 0
@@ -215,7 +203,6 @@ class MemoryAgent(ReflexAgent):
                     )
                     e.id = cursor.lastrowid
 
-            # Обрезаем старые записи в БД если превысили лимит
             self.conn.execute("""
                 DELETE FROM memory WHERE id NOT IN (
                     SELECT id FROM memory ORDER BY id DESC LIMIT ?
@@ -227,5 +214,4 @@ class MemoryAgent(ReflexAgent):
             print(f"[agent_memory] Ошибка записи: {ex}")
 
     def flush(self) -> None:
-        """Принудительная запись — вызывается при shutdown."""
         self._flush()

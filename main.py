@@ -1,7 +1,8 @@
 """
-PROMETEUS AGI — Точка входа v0.7 (с аналогиями)
+PROMETEUS AGI — Точка входа v0.8 (с диалогом и аналогиями)
 ===================================================================
-Добавлен AnalogyAgent для структурного обобщения.
+Добавлен DialogueAgent для управления диалогом и разрешения кореференции.
+Исправлено: после Wikipedia концепты сразу добавляются в graph_results.
 """
 
 from __future__ import annotations
@@ -22,7 +23,8 @@ from agents.pattern  import PatternAgent
 from agents.spawn    import SpawnAgent
 from agents.response import ResponseAgent
 from agents.search   import SearchAgent
-from agents.analogy  import AnalogyAgent   # новый агент
+from agents.analogy  import AnalogyAgent
+from agents.dialogue import DialogueAgent
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,7 +46,7 @@ def add_concept_to_graph(word: str, explanation: str, graph: KnowledgeGraph) -> 
     graph.add_concept(word, {"description": explanation})
     for token in explanation.lower().split():
         clean = token.strip('.,;:()-—»«"\'')
-        if len(clean) > 2 and graph.find(clean):
+        if len(clean) > 2 and clean != word and graph.find(clean):
             graph.add_relation(word, clean, "СВЯЗАН_С", weight=0.8)
     console.print(f"[green]✓ '{word}' добавлено в граф знаний[/green]")
 
@@ -55,6 +57,7 @@ def process_query(
     registry: AgentRegistry,
     language: LanguageAgent,
     memory:   MemoryAgent,
+    dialogue: DialogueAgent,
     pattern:  PatternAgent,
     spawn:    SpawnAgent,
     analogy:  AnalogyAgent,
@@ -66,7 +69,7 @@ def process_query(
     """
     ctx: dict = {"query": query}
 
-    # 2. Разбор языка
+    # 1. Разбор языка
     ctx = language.process(ctx) or ctx
     console.print(
         f"\n[dim]lang={ctx.get('language')} | "
@@ -74,8 +77,11 @@ def process_query(
         f"tokens={ctx.get('meaningful')}[/dim]"
     )
 
-    # 3. Память
+    # 2. Память
     ctx = memory.process(ctx) or ctx
+
+    # 3. Диалог (кореференция, диалоговые акты)
+    ctx = dialogue.process(ctx) or ctx
 
     # 4. Поиск в графе знаний
     graph_results = []
@@ -112,7 +118,7 @@ def process_query(
                     agent_hints.append(extra["hint"])
     ctx["agent_hints"] = agent_hints
 
-    # 8. Аналогии (новый шаг)
+    # 8. Аналогии
     ctx = analogy.process(ctx) or ctx
     analogies = ctx.get("analogies", [])
 
@@ -132,8 +138,16 @@ def process_query(
                 border_style="cyan",
             ))
             add_concept_to_graph(word, explanation, graph)
+            # Сразу добавляем найденный концепт в результаты
+            found = graph.find(word)
+            if found:
+                graph_results.append(found)
+            # Рекурсивное обогащение
             search.enrich(word, explanation, graph, add_concept_to_graph, console,
                           depth=2, language=lang)
+        ctx["graph_results"] = graph_results
+        # Пересчитываем наличие концептов после добавления
+        has_concepts = any("concept" in r for r in graph_results)
 
     # 11. Если всё ещё нет — спрашиваем пользователя
     if not has_concepts and not ctx.get("search_results"):
@@ -149,8 +163,9 @@ def process_query(
                     if found:
                         graph_results.append(found)
         ctx["graph_results"] = graph_results
+        has_concepts = any("concept" in r for r in graph_results)
 
-    # 12. Строим ответ (с учётом аналогий)
+    # 12. Строим ответ
     ctx = response.process(ctx) or ctx
     answer = ctx.get("answer", "Не знаю.")
 
@@ -179,7 +194,7 @@ def process_query(
 def main() -> None:
     console.print(Panel(
         "[bold cyan]PROMETEUS AGI[/bold cyan]\n"
-        "v0.7 — Аналогии · Только SQLite · Hebbian learning",
+        "v0.8 — Диалог · Аналогии · Только SQLite · Hebbian learning",
         border_style="cyan",
     ))
 
@@ -188,15 +203,16 @@ def main() -> None:
 
     language = LanguageAgent()
     memory   = MemoryAgent(conn=graph.conn)
+    dialogue = DialogueAgent()
     pattern  = PatternAgent(conn=graph.conn)
     spawn    = SpawnAgent(registry=registry)
-    analogy  = AnalogyAgent(conn=graph.conn)   # новый агент
+    analogy  = AnalogyAgent(conn=graph.conn)
     response = ResponseAgent()
     search   = SearchAgent()
 
     factory = AgentFactory()
 
-    for agent in [language, memory, pattern, spawn, analogy, response, search]:
+    for agent in [language, memory, dialogue, pattern, spawn, analogy, response, search]:
         registry.register(agent)
 
     restored = registry.load_all(factory)
@@ -241,7 +257,7 @@ def main() -> None:
 
         process_query(
             query, graph, registry,
-            language, memory, pattern, spawn, analogy, response, search,
+            language, memory, dialogue, pattern, spawn, analogy, response, search,
         )
 
         query_count += 1
