@@ -1,197 +1,258 @@
-import json
+"""
+PROMETEUS AGI — Точка входа v0.6 (разделение концептов и хинтов)
+==================================================================
+Изменения:
+  - graph_results содержит только настоящие концепты (из графа)
+  - agent_hints собирает сообщения от LearnedAgent-ов
+  - Wikipedia и запрос к пользователю запускаются, если нет концептов
+  - ResponseAgent использует оба источника
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import sys
+from pathlib import Path
+
 from rich.console import Console
 from rich.panel import Panel
-from core.graph import KnowledgeGraph
-from core.agents.language import LanguageAgent
-from core.agents.memory import MemoryAgent
-from core.agents.pattern import PatternAgent
-from core.agents.spawn import SpawnAgent
-from core.agents.response import ResponseAgent
-from core.agents.search import SearchAgent
 
+from core.graph import KnowledgeGraph
+from core.agent import AgentRegistry, AgentFactory
+from agents.language import LanguageAgent
+from agents.memory   import MemoryAgent
+from agents.pattern  import PatternAgent
+from agents.spawn    import SpawnAgent
+from agents.response import ResponseAgent
+from agents.search   import SearchAgent
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    handlers=[
+        logging.FileHandler("prometeus.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger  = logging.getLogger("prometeus.main")
 console = Console()
 
-def load_knowledge(graph, path="knowledge/base.json"):
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    for concept in data["concepts"]:
-        name = concept.pop("name")
-        # concept теперь содержит description и другие свойства
-        graph.add_concept(name, concept)
-    for rel in data["relations"]:
-        graph.add_relation(rel["from"], rel["to"], rel["type"], rel["weight"])
+DB_PATH    = "knowledge/graph.db"
+SYNC_EVERY = 10
 
-def learn(word, explanation, graph):
-    with open("knowledge/base.json", "r", encoding="utf-8") as f:
-        data = json.load(f)
 
-    existing_names = [c["name"] for c in data["concepts"] if "name" in c]
+# ══════════════════════════════════════════════════════════════════
+# РАБОТА С ГРАФОМ (без JSON)
+# ══════════════════════════════════════════════════════════════════
 
-    if word not in existing_names:
-        # СОХРАНЯЕМ description прямо в концепт!
-        data["concepts"].append({
-            "name": word,
-            "description": explanation
-        })
-    else:
-        # Обновляем description если уже есть
-        for c in data["concepts"]:
-            if c.get("name") == word:
-                c["description"] = explanation
-                break
+def add_concept_to_graph(word: str, explanation: str, graph: KnowledgeGraph) -> None:
+    """Добавляет новый концепт в граф знаний и создаёт связи."""
+    graph.add_concept(word, {"description": explanation})
+    for token in explanation.lower().split():
+        clean = token.strip('.,;:()-—»«"\'')
+        if len(clean) > 2 and graph.find(clean):
+            graph.add_relation(word, clean, "СВЯЗАН_С", weight=0.8)
+    console.print(f"[green]✓ '{word}' добавлено в граф знаний[/green]")
 
-    explanation_tokens = explanation.lower().split()
-    for token in explanation_tokens:
-        if graph.find(token):
-            already = any(
-                r["from"] == word and r["to"] == token
-                for r in data["relations"]
-            )
-            if not already:
-                data["relations"].append({
-                    "from": word,
-                    "to": token,
-                    "type": "СВЯЗАН_С",
-                    "weight": 0.8
-                })
 
-    with open("knowledge/base.json", "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+# ══════════════════════════════════════════════════════════════════
+# PIPELINE ОБРАБОТКИ ЗАПРОСА
+# ══════════════════════════════════════════════════════════════════
 
-    console.print(f"[green]✓ '{word}' сохранено в базу знаний навсегда[/green]")
+def process_query(
+    query:    str,
+    graph:    KnowledgeGraph,
+    registry: AgentRegistry,
+    language: LanguageAgent,
+    memory:   MemoryAgent,
+    pattern:  PatternAgent,
+    spawn:    SpawnAgent,
+    response: ResponseAgent,
+    search:   SearchAgent,
+) -> None:
+    """
+    Context pipeline — каждый агент получает dict и возвращает обогащённый dict.
+    """
+    # ── 1. Инициализация контекста ────────────────────────────────
+    ctx: dict = {"query": query}
 
-def process_query(query, graph, language, memory, pattern, spawn, response, search):
-    # Шаг 1 — разбираем запрос
-    parsed = language.process(query)
-    console.print(f"\n[dim]Токены: {parsed['tokens']} | Значимые: {parsed['meaningful']} | Намерение: {parsed['intent']}[/dim]")
+    # ── 2. Разбор языка ───────────────────────────────────────────
+    ctx = language.process(ctx) or ctx
+    console.print(
+        f"\n[dim]lang={ctx.get('language')} | "
+        f"intent={ctx.get('intent')} | "
+        f"tokens={ctx.get('meaningful')}[/dim]"
+    )
 
-    # Шаг 2 — ищем значимые токены в графе
-    results = []
-    for token in parsed["meaningful"]:
+    # ── 3. Память ─────────────────────────────────────────────────
+    ctx = memory.process(ctx) or ctx
+
+    # ── 4. Поиск в графе знаний ───────────────────────────────────
+    graph_results = []
+    search_tokens = ctx.get("meaningful", [])
+
+    if ctx.get("is_context_request") and not search_tokens:
+        for entry in ctx.get("memory_context", []):
+            search_tokens.extend(entry.get("keywords", []))
+
+    for token in search_tokens:
         found = graph.find(token)
         if found:
-            results.append(found)
+            graph_results.append(found)
+            for rel in found.get("relations", [])[:3]:
+                graph.activate(rel["from"], rel["to"], rel["relation"], delta=0.02)
 
-    # Шаг 3 — если контекстный запрос ("расскажи", "подробнее") — берём из памяти
-    if not results and parsed.get("is_context_request"):
-        context = memory.get_context(last_n=3)
-        for ctx in context:
-            for token in ctx.get("tokens", []):
-                found = graph.find(token)
-                if found and found not in results:
-                    results.append(found)
-        if results:
-            console.print(f"[dim]Контекстный запрос — использую память[/dim]")
+    ctx["graph_results"] = graph_results
 
-    # Шаг 4 — запоминаем
-    memory.remember({"query": query, "tokens": parsed["tokens"]})
+    # ── 5. Паттерны ───────────────────────────────────────────────
+    ctx = pattern.process(ctx) or ctx
 
-    # Шаг 5 — наблюдаем паттерны
-    pattern.observe(parsed["tokens"])
-    frequent = pattern.should_spawn()
+    # ── 6. Спаун новых агентов ────────────────────────────────────
+    ctx = spawn.process(ctx) or ctx
+    if ctx.get("spawned"):
+        console.print(f"[green]✓ Новые агенты: {ctx['spawned']}[/green]")
 
-    # Шаг 6 — создаём новых агентов
-    new_spawned = []
-    if frequent:
-        for p in frequent:
-            new_agent = spawn.spawn(p)
-            if new_agent:
-                new_spawned.append(new_agent.id)
+    # ── 7. Активация LearnedAgent-ов (их ответы сохраняем отдельно) ──
+    agent_hints = []
+    for agent in registry.get_active():
+        if agent.id.startswith("agent_") and agent.agent_type.value == "learned":
+            if agent.can_handle(ctx):
+                extra = agent.activate(ctx)
+                if extra and isinstance(extra, dict) and "hint" in extra:
+                    agent_hints.append(extra["hint"])
+    ctx["agent_hints"] = agent_hints
 
-    if new_spawned:
-        console.print(f"[green]✓ Новые агенты: {new_spawned}[/green]")
-        console.print(f"[cyan]Всего агентов: {len(spawn.get_all())}[/cyan]")
+    # ── 8. Проверяем, есть ли настоящие концепты (не хинты) ────────
+    has_concepts = any("concept" in r for r in graph_results)
 
-    # Шаг 7 — строим текстовый ответ
-    answer = response.build_response(results, parsed["intent"])
-    console.print(Panel(answer, title="[bold cyan]PROMETEUS[/bold cyan]", border_style="cyan"))
+    # ── 9. Поиск в Wikipedia, если граф не знает ───────────────────
+    if not has_concepts:
+        ctx = search.process(ctx) or ctx
+        for item in ctx.get("search_results", []):
+            word        = item["word"]
+            explanation = item["explanation"]
+            lang        = item.get("language", "ru")
+            console.print(Panel(
+                explanation,
+                title=f"[cyan]Wikipedia: {word}[/cyan]",
+                border_style="cyan",
+            ))
+            add_concept_to_graph(word, explanation, graph)
+            search.enrich(word, explanation, graph, add_concept_to_graph, console,
+                          depth=2, language=lang)
 
-    # Шаг 8 — если не знает И это не контекстный запрос — ищем в интернете
-    if "Я не знаю" in answer and not parsed.get("is_context_request"):
-        unknown = [
-            t for t in parsed["meaningful"]
-            if not graph.find(t) and len(t) > 2
-        ]
-        for word in unknown:
-            explanation = None
-
-            if search.is_online():
-                console.print(f"[cyan]Ищу '{word}' в интернете...[/cyan]")
-                explanation = search.search(word)
-                if explanation:
-                    console.print(Panel(
-                        explanation,
-                        title=f"[cyan]Найдено в Википедии: {word}[/cyan]",
-                        border_style="cyan"
-                    ))
-
-                    # Добавляем в граф
-                    graph.add_concept(word, {"description": explanation})
-                    for token in explanation.lower().split():
-                        clean = token.strip('.,;:()-—»«"\'')
-                        if graph.find(clean):
-                            graph.add_relation(word, clean, "СВЯЗАН_С", weight=0.8)
-                    learn(word, explanation, graph)
-
-                    # Рекурсивно изучаем незнакомые слова
-                    console.print(f"[cyan]Изучаю связанные понятия...[/cyan]")
-                    search.enrich(word, explanation, graph, learn, console, depth=2)
-
-                    console.print(f"[green]Концептов в графе теперь больше![/green]")
-                else:
-                    console.print(f"[yellow]В интернете не нашёл. Что такое '{word}'? (пропустить — Enter)[/yellow]")
-                    explanation = input("  Объясни: ").strip()
-                    if explanation:
-                        graph.add_concept(word, {"description": explanation})
-                        for token in explanation.lower().split():
-                            if graph.find(token):
-                                graph.add_relation(word, token, "СВЯЗАН_С", weight=0.8)
-                        learn(word, explanation, graph)
-            else:
-                console.print(f"[yellow]Нет интернета. Что такое '{word}'? (пропустить — Enter)[/yellow]")
+    # ── 10. Если всё ещё нет — спрашиваем пользователя ─────────────
+    if not has_concepts and not ctx.get("search_results"):
+        for word in ctx.get("meaningful", []):
+            if len(word) > 2 and not graph.find(word):
+                console.print(
+                    f"[yellow]Что такое '{word}'? (Enter — пропустить)[/yellow]"
+                )
                 explanation = input("  Объясни: ").strip()
                 if explanation:
-                    graph.add_concept(word, {"description": explanation})
-                    for token in explanation.lower().split():
-                        if graph.find(token):
-                            graph.add_relation(word, token, "СВЯЗАН_С", weight=0.8)
-                    learn(word, explanation, graph)
+                    add_concept_to_graph(word, explanation, graph)
+                    # обновляем graph_results для этого слова
+                    found = graph.find(word)
+                    if found:
+                        graph_results.append(found)
+        ctx["graph_results"] = graph_results
 
-    # Шаг 9 — показываем историю
-    context = memory.get_context(last_n=3)
-    console.print(f"[dim]История: {[c['query'] for c in context]}[/dim]")
+    # ── 11. Строим ответ (теперь с учётом хинтов) ──────────────────
+    ctx = response.process(ctx) or ctx
+    answer = ctx.get("answer", "Не знаю.")
 
-def main():
+    # Если есть хинты от новых агентов и нет концептов, добавим их как пояснение
+    if agent_hints and not has_concepts:
+        hints_text = "\n".join(agent_hints)
+        answer = f"{answer}\n\n[dim](Подсказки от новых агентов: {hints_text})[/dim]"
+
+    console.print(Panel(answer, title="[bold cyan]PROMETEUS[/bold cyan]", border_style="cyan"))
+
+    # ── 12. Запоминаем ответ агента ────────────────────────────────
+    memory.remember_agent_response(answer, ctx.get("language", "ru"))
+
+    # ── 13. История ────────────────────────────────────────────────
+    history = [e.text for e in memory.get_context(last_n=3)]
+    console.print(f"[dim]История: {history}[/dim]")
+
+
+# ══════════════════════════════════════════════════════════════════
+# ТОЧКА ВХОДА
+# ══════════════════════════════════════════════════════════════════
+
+def main() -> None:
     console.print(Panel(
-        "[bold cyan]PROMETEUS AGI[/bold cyan]\nПрототип v0.2 — с памятью, поиском и текстовыми ответами",
-        border_style="cyan"
+        "[bold cyan]PROMETEUS AGI[/bold cyan]\n"
+        "v0.6 — Разделение концептов и хинтов · Только SQLite · Hebbian learning",
+        border_style="cyan",
     ))
 
-    # Инициализация
-    graph = KnowledgeGraph()
+    graph    = KnowledgeGraph(db_path=DB_PATH)
+    registry = AgentRegistry(db_path=DB_PATH)
+
     language = LanguageAgent()
-    memory = MemoryAgent()
-    pattern = PatternAgent(threshold=2)
-    spawn = SpawnAgent()
+    memory   = MemoryAgent(conn=graph.conn)
+    pattern  = PatternAgent(conn=graph.conn)
+    spawn    = SpawnAgent(registry=registry)
     response = ResponseAgent()
-    search = SearchAgent()
+    search   = SearchAgent()
 
-    # Загрузка базы знаний
-    load_knowledge(graph)
+    factory = AgentFactory()
 
-    console.print("\n[bold]Введите запрос (или 'выход' для остановки)[/bold]")
+    for agent in [language, memory, pattern, spawn, response, search]:
+        registry.register(agent)
+
+    restored = registry.load_all(factory)
+    if restored:
+        console.print(f"[dim]Восстановлено из БД: {restored} агентов[/dim]")
+
+    s = registry.stats()
+    console.print(
+        f"[dim]Реестр: {s['total']} агентов | "
+        f"active={s['by_state']['active']} | "
+        f"sleeping={s['by_state']['sleeping']}[/dim]\n"
+    )
+
+    def shutdown(sig=None, frame=None) -> None:
+        console.print("\n[yellow]Завершение...[/yellow]")
+        memory.flush()
+        pattern.flush()
+        registry.sync()
+        registry.cleanup_dead()
+        registry.close()
+        graph.close()
+        console.print("[green]Сохранено. До свидания.[/green]")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT,  shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    console.print("[bold]Введите запрос (или 'выход')[/bold]")
+    query_count = 0
 
     while True:
         try:
             query = input("\n> ").strip()
-            if query.lower() in ["выход", "exit", "quit"]:
-                console.print("[yellow]Завершение. Всё сохранено.[/yellow]")
-                break
-            if query:
-                process_query(query, graph, language, memory, pattern, spawn, response, search)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Завершение. Всё сохранено.[/yellow]")
-            break
+        except EOFError:
+            shutdown()
+
+        if query.lower() in {"выход", "exit", "quit"}:
+            shutdown()
+
+        if not query:
+            continue
+
+        process_query(
+            query, graph, registry,
+            language, memory, pattern, spawn, response, search,
+        )
+
+        query_count += 1
+        if query_count % SYNC_EVERY == 0:
+            registry.sync()
+            registry.cleanup_dead()
+
 
 if __name__ == "__main__":
     main()
