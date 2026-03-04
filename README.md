@@ -194,7 +194,7 @@ If this direction interests you — open an issue or reach out directly.
 ## Getting Started
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/prometeus
+git clone https://github.com/kerberos-y/prometeus_agi.git
 cd prometeus
 pip install -r requirements.txt
 python main.py
@@ -209,7 +209,7 @@ python main.py
 Free for research, education, and non-commercial use.  
 Commercial licensing available — contact to discuss terms.
 
-📧 **your@email.com**
+📧 **mitiatalanoff@gmail.com**
 
 ---
 
