@@ -1,16 +1,23 @@
 """
-PROMETEUS AGI — Граф знаний
-============================
+PROMETEUS AGI — Граф знаний  v2.1
+===================================
+Изменения v2.1:
+  - find() fallback LIKE задокументирован как временный.
+    После миграции старых данных — удалить блок "2. Fallback".
 
-Улучшенная версия:
-- Постоянное соединение с SQLite (без повторных открытий)
-- Индексированный поиск по подстроке через SQL
-- Оптимизированный BFS для related() без построения промежуточных графов
-- Логирование вместо print
-- Транзакционная защита при записи
-- Обновление last_used для узлов
-- Совместимость со старым API
-- Методы для поиска структурных аналогий (get_edges_by_weight, find_structural_analogies)
+Изменения v2.0:
+  - add_concept() принимает уже стеммированный ключ (name = стем).
+  - find() ищет сначала точно, затем по подстроке (совместимость со старыми данными).
+
+Оригинал:
+  - Постоянное соединение с SQLite (без повторных открытий)
+  - Индексированный поиск по подстроке через SQL
+  - Оптимизированный BFS для related() без построения промежуточных графов
+  - Логирование вместо print
+  - Транзакционная защита при записи
+  - Обновление last_used для узлов
+  - Совместимость со старым API
+  - Методы для поиска структурных аналогий (get_edges_by_weight, find_structural_analogies)
 """
 
 from __future__ import annotations
@@ -24,23 +31,20 @@ from typing import Any, Optional
 
 import networkx as nx
 
-# Настройка логгера
 logger = logging.getLogger(__name__)
 
-# Константы
-WEIGHT_MAX = 1.0
-WEIGHT_MIN = 0.0
-WEIGHT_FORGET = 0.2   # ниже → связь удаляется
-WEIGHT_SLEEP = 0.3    # ниже → связь «слабая»
-DELTA_HEBBIAN = 0.05  # стандартный шаг усиления
+WEIGHT_MAX    = 1.0
+WEIGHT_MIN    = 0.0
+WEIGHT_FORGET = 0.2
+WEIGHT_SLEEP  = 0.3
+DELTA_HEBBIAN = 0.05
 
 
 class KnowledgeGraph:
     """
     Граф знаний PROMETEUS.
-
-    Использование полностью совпадает с предыдущей версией,
-    но добавлены оптимизации и улучшена надёжность.
+    Ключи узлов — стеммированные формы слов.
+    Это обеспечивает точный поиск без LIKE-запросов.
     """
 
     def __init__(self, db_path: str = "knowledge/graph.db") -> None:
@@ -48,7 +52,6 @@ class KnowledgeGraph:
         self.db_path = db_path
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
-        # Единое соединение на весь жизненный цикл
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
 
@@ -56,20 +59,18 @@ class KnowledgeGraph:
         self._load_from_db()
 
     def close(self) -> None:
-        """Закрывает соединение с БД."""
         if self.conn:
             self.conn.close()
 
     # ── Инициализация БД ──────────────────────────────────────────
 
     def _init_db(self) -> None:
-        """Создаёт таблицы и индексы, если их нет."""
         with self.conn:
             self.conn.executescript("""
                 CREATE TABLE IF NOT EXISTS nodes (
                     name       TEXT PRIMARY KEY,
                     properties TEXT DEFAULT '{}',
-                    last_used  TEXT   -- время последней активации
+                    last_used  TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS edges (
@@ -93,7 +94,6 @@ class KnowledgeGraph:
             """)
 
     def _load_from_db(self) -> None:
-        """Загружает весь граф из SQLite в MultiDiGraph."""
         try:
             cursor = self.conn.execute("SELECT name, properties FROM nodes")
             for row in cursor:
@@ -115,17 +115,28 @@ class KnowledgeGraph:
                 )
 
             logger.info(
-                f"KnowledgeGraph загружен: {self.graph.number_of_nodes()} узлов, "
-                f"{self.graph.number_of_edges()} рёбер"
+                "KnowledgeGraph загружен: %d узлов, %d рёбер",
+                self.graph.number_of_nodes(),
+                self.graph.number_of_edges(),
             )
         except Exception as e:
-            logger.error(f"Ошибка загрузки графа из БД: {e}")
+            logger.error("Ошибка загрузки графа из БД: %s", e)
             raise
 
     # ── Добавление данных ─────────────────────────────────────────
 
     def add_concept(self, name: str, properties: dict | None = None) -> None:
-        """Добавляет концепт в граф и сохраняет в БД."""
+        """
+        Добавляет концепт в граф.
+
+        ВАЖНО: name должен быть уже стеммирован перед вызовом.
+        Используй: graph.add_concept(_nlp.stem(word), {...})
+
+        properties["description"] — читаемое описание (оригинал).
+        properties["original"]    — оригинальная форма слова (опционально).
+
+        Если концепт уже существует — обновляет properties.
+        """
         properties = properties or {}
         self.graph.add_node(name, **properties)
 
@@ -137,7 +148,7 @@ class KnowledgeGraph:
                     (name, json.dumps(properties, ensure_ascii=False), now),
                 )
         except Exception as e:
-            logger.error(f"Ошибка добавления концепта '{name}': {e}")
+            logger.error("Ошибка добавления концепта '%s': %s", name, e)
 
     def add_relation(
         self,
@@ -150,14 +161,14 @@ class KnowledgeGraph:
         Добавляет типизированную связь между концептами.
         Автоматически создаёт узлы, если их нет.
         Если такая же связь уже есть — обновляет вес.
+
+        ВАЖНО: from_node и to_node должны быть стеммированы.
         """
-        # Гарантируем существование узлов
         if from_node not in self.graph:
             self.add_concept(from_node)
         if to_node not in self.graph:
             self.add_concept(to_node)
 
-        # Проверяем наличие ребра с таким relation
         existing_key = self._find_edge_key(from_node, to_node, relation)
         if existing_key is not None:
             self.graph[from_node][to_node][existing_key]["weight"] = weight
@@ -176,7 +187,10 @@ class KnowledgeGraph:
                         activated_at = excluded.activated_at
                 """, (from_node, to_node, relation, weight, now, now))
         except Exception as e:
-            logger.error(f"Ошибка добавления связи {from_node} -[{relation}]-> {to_node}: {e}")
+            logger.error(
+                "Ошибка добавления связи %s -[%s]-> %s: %s",
+                from_node, relation, to_node, e,
+            )
 
     # ── Hebbian learning ──────────────────────────────────────────
 
@@ -189,10 +203,8 @@ class KnowledgeGraph:
     ) -> None:
         """
         Усиливает или ослабляет связь (Hebbian learning).
-
-        delta > 0 → fire together, wire together (усиление)
-        delta < 0 → пользователь сказал «неверно» (ослабление)
-
+        delta > 0 → fire together, wire together
+        delta < 0 → пользователь сказал «неверно»
         Если вес падает ниже WEIGHT_FORGET — связь удаляется.
         """
         key = self._find_edge_key(from_node, to_node, relation)
@@ -212,18 +224,14 @@ class KnowledgeGraph:
                         activation_count = activation_count + 1
                     WHERE from_node = ? AND to_node = ? AND relation = ?
                 """, (new_weight, now, from_node, to_node, relation))
-
-                # Обновляем last_used для обоих узлов
                 self.conn.execute(
-                    "UPDATE nodes SET last_used = ? WHERE name = ?",
-                    (now, from_node)
+                    "UPDATE nodes SET last_used = ? WHERE name = ?", (now, from_node)
                 )
                 self.conn.execute(
-                    "UPDATE nodes SET last_used = ? WHERE name = ?",
-                    (now, to_node)
+                    "UPDATE nodes SET last_used = ? WHERE name = ?", (now, to_node)
                 )
         except Exception as e:
-            logger.error(f"Ошибка при активации связи {from_node}->{to_node}: {e}")
+            logger.error("Ошибка при активации связи %s->%s: %s", from_node, to_node, e)
 
         if new_weight <= WEIGHT_FORGET:
             self._forget(from_node, to_node, relation, key)
@@ -235,65 +243,87 @@ class KnowledgeGraph:
         relation: str,
         key: int | None = None,
     ) -> None:
-        """Удаляет слабую связь (forgetting механизм)."""
         if key is None:
             key = self._find_edge_key(from_node, to_node, relation)
         if key is not None and self.graph.has_edge(from_node, to_node, key):
             self.graph.remove_edge(from_node, to_node, key)
-
         try:
             with self.conn:
                 self.conn.execute(
                     "DELETE FROM edges WHERE from_node=? AND to_node=? AND relation=?",
                     (from_node, to_node, relation),
                 )
-            logger.debug(f"Forget: {from_node} --{relation}--> {to_node} (вес ≤ {WEIGHT_FORGET})")
+            logger.debug(
+                "Forget: %s --%s--> %s (вес ≤ %s)", from_node, relation, to_node, WEIGHT_FORGET
+            )
         except Exception as e:
-            logger.error(f"Ошибка при удалении связи {from_node}->{to_node}: {e}")
+            logger.error("Ошибка при удалении связи %s->%s: %s", from_node, to_node, e)
 
     # ── Поиск ─────────────────────────────────────────────────────
 
     def find(self, concept: str) -> dict | None:
         """
-        Возвращает концепт со всеми его связями.
-        Связи отсортированы по убыванию веса.
+        Ищет концепт в графе.
+
+        Стратегия (в порядке приоритета):
+            1. Точное совпадение — O(1), основной путь после v2.0.
+            2. Поиск по подстроке через SQLite LIKE — временный fallback
+               для совместимости со старыми записями в graph.db (до стемминга).
+               TODO: удалить после миграции старых данных.
+
+        concept должен быть стеммирован перед вызовом:
+            graph.find(_nlp.stem("компьютеры"))  →  graph.find("компьютер")
         """
-        if concept not in self.graph:
+        # 1. Точное совпадение
+        target = concept if concept in self.graph else None
+
+        # 2. Fallback: подстрока — только для старых данных без стемминга.
+        # Внимание: LIKE '%x%' может дать ложные совпадения (atom → anatomy).
+        # Убрать этот блок после полной миграции graph.db.
+        if target is None:
+            try:
+                row = self.conn.execute(
+                    "SELECT name FROM nodes WHERE name LIKE ? LIMIT 1",
+                    (f"%{concept}%",)
+                ).fetchone()
+                if row and row["name"] in self.graph:
+                    target = row["name"]
+            except Exception as e:
+                logger.error("Ошибка поиска '%s': %s", concept, e)
+
+        if target is None:
             return None
 
+        # Собираем связи
         relations = []
         seen: set[tuple] = set()
 
-        for u, v, data in self.graph.out_edges(concept, data=True):
-            rel = data.get("relation", "СВЯЗАН_С")
+        for u, v, data in self.graph.out_edges(target, data=True):
+            rel  = data.get("relation", "СВЯЗАН_С")
             wght = data.get("weight", 1.0)
-            key = (u, rel, v)
+            key  = (u, rel, v)
             if key not in seen:
                 seen.add(key)
                 relations.append({
-                    "from": u,
-                    "relation": rel,
-                    "to": v,
-                    "weight": round(wght, 3),
+                    "from": u, "relation": rel,
+                    "to": v, "weight": round(wght, 3),
                 })
 
-        for u, v, data in self.graph.in_edges(concept, data=True):
-            rel = data.get("relation", "СВЯЗАН_С")
+        for u, v, data in self.graph.in_edges(target, data=True):
+            rel  = data.get("relation", "СВЯЗАН_С")
             wght = data.get("weight", 1.0)
-            key = (u, rel, v)
+            key  = (u, rel, v)
             if key not in seen:
                 seen.add(key)
                 relations.append({
-                    "from": u,
-                    "relation": rel,
-                    "to": v,
-                    "weight": round(wght, 3),
+                    "from": u, "relation": rel,
+                    "to": v, "weight": round(wght, 3),
                 })
 
         return {
-            "concept": concept,
-            "properties": dict(self.graph.nodes[concept]),
-            "relations": sorted(relations, key=lambda x: -x["weight"]),
+            "concept":    target,
+            "properties": dict(self.graph.nodes[target]),
+            "relations":  sorted(relations, key=lambda x: -x["weight"]),
         }
 
     def related(
@@ -304,12 +334,12 @@ class KnowledgeGraph:
     ) -> list[str]:
         """
         Возвращает связанные концепты в радиусе depth с фильтром по весу.
-        Использует ручной BFS (быстрее, чем создание подграфа).
+        Использует ручной BFS.
         """
         if concept not in self.graph:
             return []
 
-        visited = {concept}
+        visited  = {concept}
         frontier = [concept]
 
         for _ in range(depth):
@@ -319,20 +349,13 @@ class KnowledgeGraph:
                     if v not in visited and data.get("weight", 1.0) >= min_weight:
                         visited.add(v)
                         next_frontier.append(v)
-                # Если нужны и входящие связи, раскомментировать:
-                # for u, _, data in self.graph.in_edges(node, data=True):
-                #     if u not in visited and data.get("weight", 1.0) >= min_weight:
-                #         visited.add(u)
-                #         next_frontier.append(u)
             frontier = next_frontier
 
         visited.remove(concept)
         return list(visited)
 
     def search(self, keyword: str) -> list[str]:
-        """
-        Поиск концептов по подстроке в названии (использует индекс SQLite).
-        """
+        """Поиск концептов по подстроке в названии."""
         try:
             cursor = self.conn.execute(
                 "SELECT name FROM nodes WHERE name LIKE ?",
@@ -340,47 +363,33 @@ class KnowledgeGraph:
             )
             return [row["name"] for row in cursor.fetchall()]
         except Exception as e:
-            logger.error(f"Ошибка поиска по ключу '{keyword}': {e}")
+            logger.error("Ошибка поиска по ключу '%s': %s", keyword, e)
             return []
 
     def strongest_relations(self, concept: str, top_n: int = 5) -> list[dict]:
-        """Топ N самых сильных связей концепта."""
         result = self.find(concept)
         if not result:
             return []
         return result["relations"][:top_n]
 
-    # ── Методы для поиска структурных аналогий ───────────────────
+    # ── Структурные аналогии ──────────────────────────────────────
 
     def get_edges_by_weight(self, min_weight: float = 0.6) -> list[dict]:
-        """Возвращает все рёбра с весом выше порога."""
         cursor = self.conn.execute(
             "SELECT from_node, to_node, relation, weight FROM edges WHERE weight >= ?",
             (min_weight,)
         )
-        rows = cursor.fetchall()
-        return [dict(row) for row in rows]
+        return [dict(row) for row in cursor.fetchall()]
 
     def find_structural_analogies(self, min_weight: float = 0.6) -> list[dict]:
-        """
-        Ищет пары рёбер с одинаковым отношением, но разными узлами.
-        Возвращает список кандидатов для создания правил.
-        """
         edges = self.get_edges_by_weight(min_weight)
-        candidates = []
-        # Группируем по отношению
-        groups = {}
+        groups: dict[str, list] = {}
         for e in edges:
-            rel = e["relation"]
-            groups.setdefault(rel, []).append((e["from_node"], e["to_node"]))
+            groups.setdefault(e["relation"], []).append((e["from_node"], e["to_node"]))
+        candidates = []
         for rel, pairs in groups.items():
-            if len(pairs) < 2:
-                continue
-            # Если в группе больше одной пары, считаем их кандидатами
-            candidates.append({
-                "relation": rel,
-                "pairs": pairs
-            })
+            if len(pairs) >= 2:
+                candidates.append({"relation": rel, "pairs": pairs})
         return candidates
 
     # ── Статистика ────────────────────────────────────────────────
@@ -388,11 +397,11 @@ class KnowledgeGraph:
     def stats(self) -> dict:
         weights = [d.get("weight", 1.0) for _, _, d in self.graph.edges(data=True)]
         return {
-            "nodes": self.graph.number_of_nodes(),
-            "edges": self.graph.number_of_edges(),
-            "avg_weight": round(sum(weights) / len(weights), 3) if weights else 0.0,
+            "nodes":          self.graph.number_of_nodes(),
+            "edges":          self.graph.number_of_edges(),
+            "avg_weight":     round(sum(weights) / len(weights), 3) if weights else 0.0,
             "sleeping_edges": sum(1 for w in weights if w < WEIGHT_SLEEP),
-            "strong_edges": sum(1 for w in weights if w >= 0.8),
+            "strong_edges":   sum(1 for w in weights if w >= 0.8),
         }
 
     def __repr__(self) -> str:
@@ -402,7 +411,7 @@ class KnowledgeGraph:
             f"avg_weight={s['avg_weight']})"
         )
 
-    # ── Вспомогательные методы ────────────────────────────────────
+    # ── Вспомогательные ───────────────────────────────────────────
 
     def _find_edge_key(
         self,
@@ -410,7 +419,6 @@ class KnowledgeGraph:
         to_node: str,
         relation: str,
     ) -> int | None:
-        """Находит ключ ребра в MultiDiGraph по тройке (from, to, relation)."""
         if not self.graph.has_node(from_node) or not self.graph.has_node(to_node):
             return None
         edges = self.graph.get_edge_data(from_node, to_node)

@@ -1,0 +1,3 @@
+PROMETEUS_LANG=ru
+DB_PATH=knowledge/graph.db
+LOG_LEVEL=INFO

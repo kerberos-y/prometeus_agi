@@ -13,6 +13,10 @@ PROMETEUS AGI — Базовый класс агента
 Персистентность:
     AgentRegistry сохраняет всех агентов в SQLite с единым соединением.
     load_all() восстанавливает состояние при перезапуске.
+
+Исправления:
+    - cleanup_dead() передаёт tuple в execute() вместо list
+    - LearnedAgent.can_handle() не делает лишний lowercase (meaningful уже в lower)
 """
 
 from __future__ import annotations
@@ -240,11 +244,14 @@ class LearnedAgent(Agent):
         self.topic = topic
 
     def can_handle(self, context: dict) -> bool:
-        """Обрабатывает только если его тема упоминается в значимых токенах."""
+        """
+        Обрабатывает только если его тема упоминается в значимых токенах.
+        meaningful уже содержит стемы в lowercase — дополнительный lower не нужен.
+        """
         if not self.is_alive():
             return False
         meaningful = context.get("meaningful", [])
-        return self.topic.lower() in [t.lower() for t in meaningful]
+        return self.topic.lower() in meaningful
 
     def process(self, context: dict) -> dict | None:
         """
@@ -261,7 +268,7 @@ class LearnedAgent(Agent):
 
 
 # ──────────────────────────────────────────────────────────────────
-# РЕЕСТР АГЕНТОВ (УЛУЧШЕННАЯ ВЕРСИЯ)
+# РЕЕСТР АГЕНТОВ
 # ──────────────────────────────────────────────────────────────────
 
 class AgentRegistry:
@@ -392,10 +399,13 @@ class AgentRegistry:
         for aid in dead_ids:
             del self._agents[aid]
 
-        # Удаляем из БД одним запросом с параметрами
-        placeholders = ','.join(['?'] * len(dead_ids))
+        # Удаляем из БД одним запросом — передаём tuple, не list
+        placeholders = ",".join(["?"] * len(dead_ids))
         with self.conn:
-            self.conn.execute(f"DELETE FROM agents WHERE id IN ({placeholders})", dead_ids)
+            self.conn.execute(
+                f"DELETE FROM agents WHERE id IN ({placeholders})",
+                tuple(dead_ids),
+            )
 
         print(f"[Registry] Удалено мёртвых агентов: {len(dead_ids)}")
         return len(dead_ids)
